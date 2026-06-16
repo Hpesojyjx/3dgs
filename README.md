@@ -35,6 +35,117 @@ Abstract: *Radiance Field methods have recently revolutionized novel-view synthe
 
 This research was funded by the ERC Advanced grant FUNGRAPH No 788065. The authors are grateful to Adobe for generous donations, the OPAL infrastructure from Université Côte d’Azur and for the HPC resources from GENCI–IDRIS (Grant 2022-AD011013409). The authors thank the anonymous reviewers for their valuable feedback, P. Hedman and A. Tewari for proofreading earlier drafts also T. Müller, A. Yu and S. Fridovich-Keil for helping with the comparisons.
 
+## Custom Extensions (this fork)
+
+This fork adds several training improvements on top of the official codebase, implemented in `train_custom.py`. All extensions are backward-compatible — `train.py` remains unchanged.
+
+### Quick Start
+
+```bash
+# 1. Setup environment
+bash shell/setup_env.sh
+
+# 2. COLMAP reconstruction (put images in <data>/input/)
+bash shell/colmap.sh <data>
+
+# 3. Train with all extensions enabled
+python train_custom.py \
+    -s <data> -m <output> \
+    --loss_type ahgs \
+    --use_dash --dash_r_min 4 --dash_r_stages 3 \
+    --iterations 100000 --refine_extra_iters 60000 \
+    --max_gaussians 7700000 --lock_after_budget \
+    --antialiasing
+```
+
+### DashGaussian — Multi-Resolution Curriculum
+
+**Paper**: [DashGaussian: Optimizing 3D Gaussian Splatting in 200 Seconds](https://arxiv.org/abs/2503.18402) (CVPR 2025)
+
+Trains progressively from low resolution to full resolution. Resolution switching points are determined automatically by **frequency energy** (mean DFT amplitude) of the training cameras — scales with richer high-frequency content receive proportionally more training budget.
+
+```bash
+--use_dash               # enable multi-resolution curriculum
+--dash_r_stages 3        # number of stages (default: 4×→2×→1×)
+--dash_r_min 4           # coarsest downscale factor
+```
+
+On each scale switch, gradient accumulators and `max_radii2D` are reset to prevent stale cross-scale statistics from polluting densification decisions.
+
+### PixelGS — Pixel-Area Weighted Gradient Accumulation
+
+**Paper**: [PixelGS](https://arxiv.org/abs/2403.12520)
+
+Replaces the original per-visit count normalization with **pixel-area weighting**, making the densification threshold scale-invariant with respect to projected Gaussian size:
+
+```
+τk′ = Σ(radii² · ‖grad‖) / Σ(radii²)
+```
+
+Always active in `train_custom.py` via `pixel_count_accum` in `GaussianModel`.
+
+### AH-GS — VGG Perceptual Loss with Decay (`--loss_type ahgs`)
+
+Adds a VGG-19 perceptual loss term that decays linearly as training progresses, contributing most when geometry is rough and fading out as it converges. When combined with `--use_dash`, the perceptual loss is suppressed during low-resolution warm-up stages and only activates at full resolution.
+
+Images are downsampled to a maximum long-edge of 2048 before entering VGG to avoid OOM on high-resolution inputs.
+
+### Gaussian Budget Control
+
+Caps the total Gaussian count and optionally locks densification once the budget is reached:
+
+```bash
+--max_gaussians 7700000   # hard cap (0 = unlimited)
+--lock_after_budget       # freeze densification once cap is hit
+```
+
+### Extended Refinement Tail (`--refine_extra_iters`)
+
+Appends extra iterations after the main training phase where the Gaussian set is frozen (no densification, no opacity reset) and only appearance parameters continue to be optimized. This separates geometry-building from appearance-polishing:
+
+```bash
+--iterations 100000         # main training phase
+--refine_extra_iters 60000  # pure refinement phase (total = 160k)
+```
+
+### Alternative Loss Modes
+
+| `--loss_type` | Description |
+|---------------|-------------|
+| `baseline` | Original: L1 + D-SSIM (default) |
+| `ahgs` | + VGG perceptual loss with linear decay |
+| `fregs` | + FreGS progressive frequency-domain regularization |
+| `depth_reg` | + Depth map total-variation regularization |
+| `normal_reg` | + Normal consistency regularization |
+
+### CityGaussianV2 — Elongation Filter
+
+**Paper**: [CityGaussianV2](https://arxiv.org/abs/2411.00771)
+
+Skips densification for needle-like Gaussians (`max_scale / min_scale > 10`) to prevent artifact cascades. Applied in both split and clone paths.
+
+### Bug Fixes
+
+- **`scene/dataset_readers.py`**: `np.byte` (signed, wraps > 127) → `np.uint8` when converting NeRF Synthetic RGBA images.
+- **`scene/gaussian_model.py` PLY saving**: fixed silent data corruption in bulk attribute assignment when NumPy structured array field ordering differed from the attribute matrix columns.
+- **`big_points_vs` pruning**: `max_screen_size` is now passed as `None` during Dash training; pixel-radius thresholds are not scale-aware and caused spurious pruning of valid geometry on resolution switches. World-space pruning (`big_points_ws`) is used instead.
+
+### New CLI Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--loss_type` | `baseline` | Loss variant: `baseline`, `ahgs`, `fregs`, `depth_reg`, `normal_reg` |
+| `--use_dash` | off | Enable DashGaussian multi-resolution curriculum |
+| `--dash_r_min` | `4` | Coarsest downscale factor |
+| `--dash_r_stages` | `3` | Number of resolution stages |
+| `--max_gaussians` | `0` | Maximum Gaussian count (0 = unlimited) |
+| `--lock_after_budget` | off | Freeze densification once budget is reached |
+| `--refine_extra_iters` | `0` | Extra refinement iterations after main training |
+| `--wandb_project` | — | W&B project name (optional) |
+| `--wandb_name` | — | W&B run name (optional) |
+
+---
+
 ## NEW FEATURES !
 
 We have limited resources for maintaining and updating the code. However, we have added a few new features since the original release that are inspired by some of the excellent work many other researchers have been doing on 3DGS. We will be adding other features within the ability of our resources.
@@ -42,7 +153,7 @@ We have limited resources for maintaining and updating the code. However, we hav
 **Update of October 2024**: We integrated [training speed acceleration](#training-speed-acceleration) and made it compatible with [depth regularization](#depth-regularization), [anti-aliasing](#anti-aliasing) and [exposure compensation](#exposure-compensation). We have enhanced the SIBR real time viewer by correcting bugs and adding features in the [Top View](#sibr-top-view) that allows visualization of input and user cameras.
 
 **Update of Spring 2024**:
-Orange Labs has kindly added [OpenXR support](#openxr-support) for VR viewing. 
+Orange Labs has kindly added [OpenXR support](#openxr-support) for VR viewing.
 
 ## Step-by-step Tutorial
 
