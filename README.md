@@ -41,6 +41,8 @@ This fork adds several training improvements on top of the official codebase, im
 
 ### Quick Start
 
+**v4.1 is the final recommended configuration.** It combines all extensions (DashGaussian + PixelGS + AH-GS + budget lock) and is provided as ready-to-run scripts in `shell/train_v4.1*.sh`.
+
 ```bash
 # 1. Setup environment
 bash shell/setup_env.sh
@@ -48,7 +50,23 @@ bash shell/setup_env.sh
 # 2. COLMAP reconstruction (put images in <data>/input/)
 bash shell/colmap.sh <data>
 
-# 3. Train with all extensions enabled
+# 3. Train — choose a schedule:
+bash shell/train_v4.1.sh      <data> [output]   # 120k iters  (default, recommended)
+bash shell/train_v4.1_160k.sh <data> [output]   # 160k iters  (higher quality)
+bash shell/train_v4.1_200k.sh <data> [output]   # 200k iters  (maximum quality)
+bash shell/train_v4.1_50k.sh  <data> [output]   # 50k iters   (fast A/B validation)
+```
+
+| Script | Main iters | Refine tail | Gaussian cap | Use case |
+|--------|-----------|-------------|--------------|----------|
+| `train_v4.1.sh` | 100k | 20k | 8M | Default |
+| `train_v4.1_160k.sh` | 100k | 60k | 7.7M | High quality |
+| `train_v4.1_200k.sh` | 100k | 100k | 10M | Maximum quality |
+| `train_v4.1_50k.sh` | 30k | 20k | 8M | Quick validation |
+
+Or run `train_custom.py` directly with custom parameters:
+
+```bash
 python train_custom.py \
     -s <data> -m <output> \
     --loss_type ahgs \
