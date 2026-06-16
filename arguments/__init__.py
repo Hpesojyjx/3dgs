@@ -97,6 +97,12 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        self.use_dash = False
+        self.dash_r_min = 4
+        self.dash_r_stages = 3
+        self.max_gaussians = 0
+        self.lock_after_budget = False
+        self.refine_extra_iters = 0
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

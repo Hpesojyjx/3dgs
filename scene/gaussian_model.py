@@ -60,6 +60,7 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
+        self.pixel_count_accum = torch.empty(0)
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -179,6 +180,7 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.pixel_count_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -251,7 +253,8 @@ class GaussianModel:
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
         attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
-        elements[:] = list(map(tuple, attributes))
+        for i, attr_name in enumerate(self.construct_list_of_attributes()):
+            elements[attr_name] = attributes[:, i]
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
@@ -360,6 +363,7 @@ class GaussianModel:
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
+        self.pixel_count_accum = self.pixel_count_accum[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
 
@@ -404,7 +408,88 @@ class GaussianModel:
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.pixel_count_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+    def prune_to_budget(self, max_count):
+        n = self.get_xyz.shape[0]
+        if n <= max_count:
+            return
+        opacities = self.get_opacity.squeeze(-1)
+        keep_idx = torch.topk(opacities, max_count, largest=True).indices
+        keep_mask = torch.zeros(n, dtype=torch.bool, device="cuda")
+        keep_mask[keep_idx] = True
+        self.prune_points(~keep_mask)
+
+    def emergency_prune_largest(self, frac=0.05):
+        """OOM 应急：裁掉世界空间最大的一批高斯。
+        rasterizer 的 binning buffer 在巨型高斯下会爆炸，按尺寸裁是最有效的止血。
+        """
+        n = self.get_xyz.shape[0]
+        if n == 0:
+            return 0
+        k = max(1, int(n * frac))
+        sizes = self.get_scaling.max(dim=1).values
+        kill_idx = torch.topk(sizes, k, largest=True).indices
+        mask = torch.zeros(n, dtype=torch.bool, device="cuda")
+        mask[kill_idx] = True
+        # prune_points 会访问 self.tmp_radii，render 路径上它是 None，先占位避免 NPE
+        if self.tmp_radii is None:
+            self.tmp_radii = torch.zeros(n, device="cuda")
+        self.prune_points(mask)
+        self.tmp_radii = None
+        return k
+
+    def force_split_by_screen_size(self, screen_threshold, N=2):
+        """Dash scale 切换时预防性分裂：屏幕半径超过阈值的高斯无条件 split，绕开梯度判断。
+        切换瞬间一颗高斯在新分辨率下的屏幕覆盖会按 (old_scale/new_scale) 放大；
+        提前切小避免后续 binning buffer 爆 + 给高频细节腾出表达空间。
+        """
+        n_init = self.get_xyz.shape[0]
+        if n_init == 0:
+            return 0
+        big_mask = self.max_radii2D > screen_threshold
+        n_big = int(big_mask.sum().item())
+        if n_big == 0:
+            return 0
+        # densification_postfix / prune_points 都会访问 tmp_radii，先占位
+        self.tmp_radii = self.max_radii2D.clone()
+
+        stds = self.get_scaling[big_mask].repeat(N, 1)
+        means = torch.zeros((stds.size(0), 3), device="cuda")
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self._rotation[big_mask]).repeat(N, 1, 1)
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[big_mask].repeat(N, 1)
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[big_mask].repeat(N, 1) / (0.8 * N))
+        new_rotation = self._rotation[big_mask].repeat(N, 1)
+        new_features_dc = self._features_dc[big_mask].repeat(N, 1, 1)
+        new_features_rest = self._features_rest[big_mask].repeat(N, 1, 1)
+        new_opacity = self._opacity[big_mask].repeat(N, 1)
+        new_tmp_radii = self.tmp_radii[big_mask].repeat(N)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest,
+                                   new_opacity, new_scaling, new_rotation, new_tmp_radii)
+
+        prune_filter = torch.cat((big_mask, torch.zeros(N * n_big, device="cuda", dtype=bool)))
+        self.prune_points(prune_filter)
+        self.tmp_radii = None
+        torch.cuda.empty_cache()
+        return n_big
+
+    def reset_densification_stats(self):
+        """Dash scale 切换时清空梯度/像素/半径累加器，让新 scale 决策不被旧 scale 数据污染。"""
+        n = self.get_xyz.shape[0]
+        self.xyz_gradient_accum = torch.zeros((n, 1), device="cuda")
+        self.pixel_count_accum = torch.zeros((n, 1), device="cuda")
+        self.denom = torch.zeros((n, 1), device="cuda")
+        self.max_radii2D = torch.zeros((n,), device="cuda")
+
+    def prune_oversized(self, extent, scale_thresh=0.1):
+        """按世界空间尺寸裁剪过大的高斯。opacity reset 之后调用避免下一帧 binning 爆炸。"""
+        big = self.get_scaling.max(dim=1).values > scale_thresh * extent
+        n_big = int(big.sum().item())
+        if n_big > 0:
+            self.prune_points(big)
+        return n_big
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -414,6 +499,10 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+
+        # CityGaussianV2: elongation filter — skip needle-like Gaussians to prevent artifact explosion
+        elongation = self.get_scaling.max(dim=1).values / self.get_scaling.min(dim=1).values.clamp(min=1e-6)
+        selected_pts_mask = torch.logical_and(selected_pts_mask, elongation <= 10.0)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
@@ -437,6 +526,10 @@ class GaussianModel:
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+
+        # CityGaussianV2: elongation filter
+        elongation = self.get_scaling.max(dim=1).values / self.get_scaling.min(dim=1).values.clamp(min=1e-6)
+        selected_pts_mask = torch.logical_and(selected_pts_mask, elongation <= 10.0)
         
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
@@ -449,8 +542,87 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
+    def densify_and_clone_topk(self, grads, grad_threshold, scene_extent, n_densify):
+        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                              torch.max(self.get_scaling, dim=1).values <= self.percent_dense * scene_extent)
+        elongation = self.get_scaling.max(dim=1).values / self.get_scaling.min(dim=1).values.clamp(min=1e-6)
+        selected_pts_mask = torch.logical_and(selected_pts_mask, elongation <= 10.0)
+
+        topk_mask = torch.zeros_like(selected_pts_mask)
+        topk_mask.index_fill_(0, torch.topk(grads.squeeze(), min(n_densify, grads.shape[0])).indices, True)
+        selected_pts_mask = torch.logical_and(selected_pts_mask, topk_mask)
+
+        new_xyz = self._xyz[selected_pts_mask]
+        new_features_dc = self._features_dc[selected_pts_mask]
+        new_features_rest = self._features_rest[selected_pts_mask]
+        new_opacities = self._opacity[selected_pts_mask]
+        new_scaling = self._scaling[selected_pts_mask]
+        new_rotation = self._rotation[selected_pts_mask]
+        new_tmp_radii = self.tmp_radii[selected_pts_mask]
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+
+    def densify_and_split_topk(self, grads, grad_threshold, scene_extent, n_densify, N=2):
+        n_init_points = self.get_xyz.shape[0]
+        padded_grad = torch.zeros((n_init_points), device="cuda")
+        padded_grad[:grads.shape[0]] = grads.squeeze()
+        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+        selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent)
+        elongation = self.get_scaling.max(dim=1).values / self.get_scaling.min(dim=1).values.clamp(min=1e-6)
+        selected_pts_mask = torch.logical_and(selected_pts_mask, elongation <= 10.0)
+
+        topk_mask = torch.zeros_like(selected_pts_mask)
+        topk_mask.index_fill_(0, torch.topk(padded_grad.squeeze(), min(n_densify, padded_grad.shape[0])).indices, True)
+        selected_pts_mask = torch.logical_and(selected_pts_mask, topk_mask)
+
+        stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
+        means = torch.zeros((stds.size(0), 3), device="cuda")
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N))
+        new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
+        new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
+        new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+
+        prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
+        self.prune_points(prune_filter)
+
+    def prune_and_densify(self, max_grad, min_opacity, extent, max_screen_size, radii, densify_rate=1.0):
+        """DashGaussian: 先剪枝，再用 topK + densify_rate 控制增长量，返回自然致密化数量用于 momentum 更新。"""
+        cur_n_gaussian = self.get_xyz.shape[0]
+        self.tmp_radii = radii
+
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        # 屏幕像素半径阈值：dash 训练必须保留，否则低梯度大球永远不会被剪。
+        # 调用方按当前 resolution_scale 把 4K 等价阈值换算到本 scale 下的像素，跨 scale 语义一致。
+        big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+        prune_mask = torch.logical_or(prune_mask, big_points_ws)
+        if max_screen_size is not None:
+            big_points_vs = self.max_radii2D > max_screen_size
+            prune_mask = torch.logical_or(prune_mask, big_points_vs)
+
+        grads = self.xyz_gradient_accum / self.pixel_count_accum.clamp(min=1.0)
+        grads[grads.isnan()] = 0.0
+
+        n_natural = (grads.squeeze() >= max_grad).sum()
+        n_densify = min(int(cur_n_gaussian * (1 + densify_rate) - self.get_xyz.shape[0]), self.get_xyz.shape[0])
+        n_densify = max(n_densify, 0)
+
+        self.densify_and_clone_topk(grads, max_grad, extent, n_densify)
+        self.densify_and_split_topk(grads, max_grad, extent, n_densify)
+
+        self.tmp_radii = None
+        torch.cuda.empty_cache()
+        return n_natural
+
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
-        grads = self.xyz_gradient_accum / self.denom
+        # PixelGS: τk′ = Σ(count_kv · ‖grad_kv‖) / Σcount_kv
+        grads = self.xyz_gradient_accum / self.pixel_count_accum.clamp(min=1.0)
         grads[grads.isnan()] = 0.0
 
         self.tmp_radii = radii
@@ -458,16 +630,30 @@ class GaussianModel:
         self.densify_and_split(grads, max_grad, extent)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
-        if max_screen_size:
+        big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+        prune_mask = torch.logical_or(prune_mask, big_points_ws)
+        if max_screen_size is not None:
             big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+            prune_mask = torch.logical_or(prune_mask, big_points_vs)
         self.prune_points(prune_mask)
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
 
         torch.cuda.empty_cache()
 
-    def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+    def add_densification_stats(self, viewspace_point_tensor, update_filter, radii, resolution_scale=1.0):
+        grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+        # Insight1: 实测（ahgs_v3_cubeman0604_0605-0159）各 scale 下 grad_norm 差异约 3x，
+        # 但与训练阶段完全混淆（前期梯度大≠低分辨率梯度大），暂不做归一化。
+        # Insight2 观测：记录各 scale 下梯度分布，验证 size_threshold 修复后梯度语义是否受影响
+        if grad_norm.numel() > 0 and torch.rand(1).item() < 0.1:
+            print(f"[GradStats] scale={resolution_scale:.1f}  "
+                  f"mean={grad_norm.mean().item():.6f}  "
+                  f"median={grad_norm.median().item():.6f}  "
+                  f"pct>0.0002={(grad_norm > 0.0002).float().mean().item():.3f}")
+        pixel_area = (radii[update_filter].float() ** 2).clamp(min=1.0).unsqueeze(-1)
+        # PixelGS: accumulate pixel-weighted gradient and pixel count separately
+        # τk′ = Σ(count_kv · ‖grad_kv‖) / Σcount_kv
+        self.xyz_gradient_accum[update_filter] += grad_norm * pixel_area
+        self.pixel_count_accum[update_filter] += pixel_area
         self.denom[update_filter] += 1

@@ -1,8 +1,30 @@
 *.pyc
+__pycache__/
 .vscode
-output
-build
+
+# Training outputs
+output/
+build/
+tensorboard_3d/
+screenshots/
+
+# COLMAP / data artifacts
+images/
+input/
+raw.mp4
+distorted/
+sparse/
+stereo/
+*.db
+
+# Python package build artifacts
+*.egg-info/
+dist/
 diff_rasterization/diff_rast.egg-info
 diff_rasterization/dist
-tensorboard_3d
-screenshots
+
+# Internal cluster job submission scripts (platform-specific)
+shell/submit_*.sh
+
+# Internal research notes
+INSIGHT.md
